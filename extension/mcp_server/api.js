@@ -1370,6 +1370,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             description: { type: "string", description: "Task description/body (optional)" },
             priority: { type: "integer", description: "Priority: 1=high, 5=normal, 9=low (optional)" },
             categories: { type: "array", items: { type: "string" }, description: "Category labels (optional). Use listCategories to get exact existing names before setting." },
+            alarm: {
+              oneOf: [
+                {
+                  type: "object",
+                  properties: { minutesBefore: { type: "integer", minimum: 0, maximum: 525600 } },
+                  required: ["minutesBefore"],
+                  additionalProperties: false,
+                  description: "Display reminder this many minutes before the task due date"
+                },
+                {
+                  type: "object",
+                  properties: { dateTime: { type: "string", minLength: 1 } },
+                  required: ["dateTime"],
+                  additionalProperties: false,
+                  description: "Display reminder at this absolute ISO 8601 date/time"
+                },
+                { type: "null", description: "No reminder (accepted for compatibility; updateTask uses this to clear one)" }
+              ],
+              description: "Optional display reminder. Use minutesBefore for a reminder relative to dueDate, or dateTime for an absolute reminder."
+            },
             skipReview: { type: "boolean", description: "Request direct saving without a review dialog. Honored only when the user explicitly disables the default-on skipReview safety block (default: false)." },
           },
           required: ["title"],
@@ -1414,6 +1434,26 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             completed: { type: "boolean", description: "Set to true to mark the task done (sets percentComplete=100 and records completedDate), false to reopen it (optional)" },
             percentComplete: { type: "integer", description: "Completion percentage 0–100 (optional)" },
             priority: { type: "integer", description: "Priority: 1=high, 5=normal, 9=low (optional)" },
+            alarm: {
+              oneOf: [
+                {
+                  type: "object",
+                  properties: { minutesBefore: { type: "integer", minimum: 0, maximum: 525600 } },
+                  required: ["minutesBefore"],
+                  additionalProperties: false,
+                  description: "Display reminder this many minutes before the task due date"
+                },
+                {
+                  type: "object",
+                  properties: { dateTime: { type: "string", minLength: 1 } },
+                  required: ["dateTime"],
+                  additionalProperties: false,
+                  description: "Display reminder at this absolute ISO 8601 date/time"
+                },
+                { type: "null", description: "Clear the existing reminder" }
+              ],
+              description: "Optional display reminder. Pass null to clear the reminder."
+            },
           },
           required: ["taskId", "calendarId"],
         },
@@ -2014,6 +2054,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
             let cal = null;
             let CalEvent = null;
             let CalTodo = null;
+            let CalAlarm = null;
             try {
               const calModule = ChromeUtils.importESModule(
                 "resource:///modules/calendar/calUtils.sys.mjs"
@@ -2027,6 +2068,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 "resource:///modules/CalTodo.sys.mjs"
               );
               CalTodo = CT;
+              try {
+                const { CalAlarm: CA } = ChromeUtils.importESModule(
+                  "resource:///modules/CalAlarm.sys.mjs"
+                );
+                CalAlarm = CA;
+              } catch {
+                // Older Thunderbird versions expose cal.createAlarm() instead.
+              }
             } catch {
               // Calendar not available
             }
@@ -4473,6 +4522,78 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return result;
             }
 
+            // BEGIN TASK ALARM HELPERS
+            function createTaskAlarm() {
+              if (CalAlarm) return new CalAlarm();
+              if (cal && typeof cal.createAlarm === "function") return cal.createAlarm();
+              return null;
+            }
+
+            function configureTaskAlarm(item, alarmConfig) {
+              if (alarmConfig === undefined) return null;
+              if (typeof item.clearAlarms !== "function" || typeof item.addAlarm !== "function") {
+                return "Calendar items do not support alarms";
+              }
+              if (alarmConfig === null) {
+                item.clearAlarms();
+                return null;
+              }
+              if (!alarmConfig || typeof alarmConfig !== "object" || Array.isArray(alarmConfig)) {
+                return "alarm must be an object or null";
+              }
+
+              const hasMinutes = Object.prototype.hasOwnProperty.call(alarmConfig, "minutesBefore");
+              const hasDateTime = Object.prototype.hasOwnProperty.call(alarmConfig, "dateTime");
+              if (hasMinutes === hasDateTime) {
+                return "alarm must specify exactly one of minutesBefore or dateTime";
+              }
+
+              const alarm = createTaskAlarm();
+              if (!alarm) return "Calendar alarm module not available";
+              alarm.action = "DISPLAY";
+              if (hasMinutes) {
+                const minutes = alarmConfig.minutesBefore;
+                if (!Number.isInteger(minutes) || minutes < 0 || minutes > 525600) {
+                  return "alarm.minutesBefore must be an integer between 0 and 525600";
+                }
+                if (!item.dueDate) {
+                  return "alarm.minutesBefore requires a task dueDate";
+                }
+                alarm.related = Ci.calIAlarm.ALARM_RELATED_END;
+                alarm.offset = cal.createDuration(`-PT${minutes}M`);
+              } else {
+                if (typeof alarmConfig.dateTime !== "string" || !alarmConfig.dateTime.trim()) {
+                  return "alarm.dateTime must be a non-empty ISO 8601 date/time";
+                }
+                const js = new Date(alarmConfig.dateTime);
+                if (isNaN(js.getTime())) return `Invalid alarm.dateTime: ${alarmConfig.dateTime}`;
+                alarm.related = Ci.calIAlarm.ALARM_RELATED_ABSOLUTE;
+                alarm.alarmDate = cal.dtz.jsDateToDateTime(js, cal.dtz.defaultTimezone);
+              }
+              item.clearAlarms();
+              item.addAlarm(alarm);
+              return null;
+            }
+
+            function formatTaskAlarm(item) {
+              if (!item || typeof item.getAlarms !== "function") return null;
+              let alarms;
+              try { alarms = item.getAlarms(); } catch { return null; }
+              if (!alarms || alarms.length === 0) return null;
+              const alarm = alarms[0];
+              if (alarm.related === Ci.calIAlarm.ALARM_RELATED_ABSOLUTE && alarm.alarmDate) {
+                return { dateTime: calDateToISO(alarm.alarmDate) };
+              }
+              if (alarm.related === Ci.calIAlarm.ALARM_RELATED_END && alarm.offset) {
+                const seconds = Number(alarm.offset.inSeconds);
+                if (Number.isFinite(seconds) && seconds <= 0 && seconds % 60 === 0) {
+                  return { minutesBefore: Math.min(525600, Math.max(0, Math.round(-seconds / 60))) };
+                }
+              }
+              return null;
+            }
+            // END TASK ALARM HELPERS
+
             function formatTask(item, calendar) {
               const completed = item.isCompleted || (item.percentComplete === 100);
               const priority = item.priority || 0; // 0=undefined, 1=high, 5=normal, 9=low per iCal
@@ -4488,10 +4609,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 percentComplete: item.percentComplete || 0,
                 priority,
                 description: item.getProperty("DESCRIPTION") || "",
+                alarm: formatTaskAlarm(item),
               };
             }
 
-            async function updateTask(taskId, calendarId, title, dueDate, description, completed, percentComplete, priority) {
+            async function updateTask(taskId, calendarId, title, dueDate, description, completed, percentComplete, priority, alarm) {
               if (!cal) return { error: "Calendar not available" };
               try {
                 if (!taskId) return { error: "taskId is required" };
@@ -4559,6 +4681,12 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                     }
                   }
                   changes.push("dueDate");
+                }
+
+                if (alarm !== undefined) {
+                  const alarmError = configureTaskAlarm(newItem, alarm);
+                  if (alarmError) return { error: alarmError };
+                  changes.push("alarm");
                 }
 
                 // 'completed' and 'percentComplete' both control completion state.
@@ -4980,7 +5108,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
               return `<html><body><div>${processed.replace(/\n/g, "<br>")}</div></body></html>`;
             }
 
-            async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview) {
+            async function createTask(title, dueDate, calendarId, description, priority, categories, skipReview, alarm) {
               if (!cal || !CalTodo) return { error: "Calendar module not available" };
               if (skipReview && isSkipReviewBlocked()) {
                 return { error: "User preference blocks skipReview. Retry with skipReview: false (or omitted) to open the review dialog instead." };
@@ -5028,6 +5156,8 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 if (priority !== undefined && priority !== null) todo.priority = priority;
                 if (categories && categories.length > 0) todo.setCategories(categories);
                 if (targetCalendar) todo.calendar = targetCalendar;
+                const alarmError = configureTaskAlarm(todo, alarm);
+                if (alarmError) return { error: alarmError };
 
                 if (skipReview) {
                   if (!targetCalendar) {
@@ -8037,7 +8167,7 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
              * Not a full JSON Schema implementation -- intentionally minimal --
              * but covers the keywords actually used by toolSchemas:
              *   - type (string/number/integer/boolean/array/object)
-             *   - enum, minLength, and base64 contentEncoding
+             *   - enum, minLength, minimum/maximum, and base64 contentEncoding
              *   - properties + required + additionalProperties (on objects)
              *   - items (on arrays), oneOf, and anyOf
              * `path` is the dotted property path used in error messages.
@@ -8110,6 +8240,14 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 }
                 if (schema.contentEncoding === "base64" && !isValidBase64(value)) {
                   errors.push(`Parameter '${path}' must contain valid base64 data`);
+                }
+              }
+              if ((expectedType === "number" || expectedType === "integer") && typeof value === "number") {
+                if (schema.minimum !== undefined && value < schema.minimum) {
+                  errors.push(`Parameter '${path}' must be at least ${schema.minimum}`);
+                }
+                if (schema.maximum !== undefined && value > schema.maximum) {
+                  errors.push(`Parameter '${path}' must be at most ${schema.maximum}`);
                 }
               }
 
@@ -8276,11 +8414,11 @@ var mcpServer = class extends ExtensionCommon.ExtensionAPI {
                 case "listCategories":
                   return listCategories();
                 case "createTask":
-                  return await createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview);
+                  return await createTask(args.title, args.dueDate, args.calendarId, args.description, args.priority, args.categories, args.skipReview, args.alarm);
                 case "listTasks":
                   return await listTasks(args.calendarId, args.completed, args.dueBefore, args.maxResults);
                 case "updateTask":
-                  return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority);
+                  return await updateTask(args.taskId, args.calendarId, args.title, args.dueDate, args.description, args.completed, args.percentComplete, args.priority, args.alarm);
                 case "sendMail":
                   return await composeMail(args.to, args.subject, args.body, args.cc, args.bcc, args.isHtml, args.from, args.attachments, args.skipReview);
                 case "saveDraft":

@@ -102,9 +102,9 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 | `listEvents` | Query events by date range with recurring event expansion. Returns `status` on each event. |
 | `updateEvent` | Modify an event's title, dates, location, description, or `status` |
 | `deleteEvent` | Delete a calendar event by ID |
-| `createTask` | Open a pre-filled task dialog for review; direct creation via `skipReview` requires explicitly disabling the default safety block |
+| `createTask` | Open a pre-filled task dialog for review; supports an optional `alarm` reminder (`minutesBefore` relative to `dueDate` or absolute `dateTime`); direct creation via `skipReview` requires explicitly disabling the default safety block |
 | `listTasks` | List tasks/to-dos from calendars -- filter by completion status, due date, or calendar |
-| `updateTask` | Update a task's title, due date, description, priority, completion status, or percent complete |
+| `updateTask` | Update a task's title, due date, description, priority, completion status, percent complete, or `alarm` reminder (`null` clears it) |
 
 ### Access Control
 
@@ -115,6 +115,8 @@ Full control over Thunderbird's message filters. Changes persist immediately. Yo
 Account and tool access are configured via the extension settings page (Tools > Add-ons > Thunderbird MCP > Options). Access control is not MCP-exposed -- only the user can change it.
 
 The same settings page has a "Send Safety" section. **Block `skipReview`** is enabled by default and rejects `skipReview: true` for `sendMail`, `replyToMessage`, `forwardMessage`, `createEvent`, and `createTask`; their review window or dialog still opens normally. `skipReview` is honored only after you explicitly disable this preference.
+
+Task reminders are configured separately from the deadline: `alarm: { "minutesBefore": 30 }` displays a reminder 30 minutes before `dueDate`, while `alarm: { "dateTime": "2026-09-03T08:30:00+02:00" }` uses an absolute time. `updateTask` accepts `alarm: null` to remove the reminder. A relative reminder requires a `dueDate`.
 
 ---
 

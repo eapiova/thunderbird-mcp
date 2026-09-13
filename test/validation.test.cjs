@@ -1145,6 +1145,12 @@ const richValidator = createValidator([
       properties: {
         title: { type: 'string' },
         priority: { type: 'integer' },
+        alarm: {
+          oneOf: [
+            { type: 'object', properties: { minutesBefore: { type: 'integer', minimum: 0, maximum: 525600 } }, required: ['minutesBefore'], additionalProperties: false },
+            { type: 'object', properties: { dateTime: { type: 'string', minLength: 1 } }, required: ['dateTime'], additionalProperties: false },
+          ],
+        },
       },
       required: ['title'],
     },
@@ -1288,6 +1294,42 @@ describe('Validator: integer type', () => {
     const errors = richValidator('createTask', { title: 't', priority: '5' });
     assert.equal(errors.length, 1);
     assert.match(errors[0], /must be an integer/);
+  });
+});
+
+describe('Validator: task alarms', () => {
+  it('exposes the documented alarm alternatives in production', () => {
+    for (const name of ['createTask', 'updateTask']) {
+      const tool = productionAttachmentValidation.buildTools().find(t => t.name === name);
+      assert.ok(tool.inputSchema.properties.alarm, `${name} alarm schema missing`);
+      assert.equal(JSON.stringify(tool.inputSchema.properties.alarm.oneOf.map(branch => branch.required)), JSON.stringify([
+        ['minutesBefore'], ['dateTime'], undefined,
+      ]));
+    }
+  });
+
+  it('accepts a relative or absolute alarm', () => {
+    assert.equal(validateProductionToolArgs('createTask', {
+      title: 't', dueDate: '2026-09-03T10:00:00Z', alarm: { minutesBefore: 15 },
+    }).length, 0);
+    assert.equal(validateProductionToolArgs('createTask', {
+      title: 't', alarm: { dateTime: '2026-09-03T09:45:00Z' },
+    }).length, 0);
+  });
+
+  it('accepts null to clear an updateTask reminder', () => {
+    assert.deepEqual(validateProductionToolArgs('updateTask', {
+      taskId: 'task-1', calendarId: 'calendar-1', alarm: null,
+    }), []);
+  });
+
+  it('rejects malformed alarm objects and out-of-range offsets', () => {
+    const malformed = validateProductionToolArgs('createTask', { title: 't', alarm: {} });
+    assert.ok(malformed.some(e => /alarm.*schema variant/.test(e)), JSON.stringify(malformed));
+    const outOfRange = validateProductionToolArgs('createTask', { title: 't', alarm: { minutesBefore: -1 } });
+    assert.ok(outOfRange.some(e => /alarm\.minutesBefore.*at least 0/.test(e)), JSON.stringify(outOfRange));
+    const extra = validateProductionToolArgs('createTask', { title: 't', alarm: { dateTime: 'x', minutesBefore: 1 } });
+    assert.ok(extra.some(e => /alarm.*schema variant/.test(e)), JSON.stringify(extra));
   });
 });
 
